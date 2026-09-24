@@ -2,6 +2,9 @@
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
+#include <cstdio>
+#include <cstring>
+#include <mutex>
 
 namespace
 {
@@ -63,23 +66,70 @@ namespace
                 }
             });
         // 0x467940: sceCdRead@0x00467940 — Cycle 5 blocker LBN 0x540000 sectors 2
-        // dest a2=0x75c540 at pc=0x420020. Runtime's CD.cpp needs a CD image;
-        // triage: zero-fill dest and return 1 (success) per Walkthrough §6.
+        // dest a2=0x75c540 at pc=0x420020. Try host WAD mapping before zero-fill triage.
         runtime.registerFunction(0x00467940u,
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
                 const uint32_t entryPc = ctx->pc;
-                const uint32_t dest = getRegU32(ctx, 6); // a2
+                const uint32_t lsn = getRegU32(ctx, 4); // a0
                 const uint32_t sectors = getRegU32(ctx, 5); // a1
+                const uint32_t dest = getRegU32(ctx, 6); // a2
+                bool handled = false;
                 if (dest != 0 && sectors != 0 && sectors < 0x1000)
                 {
                     uint8_t *host = getMemPtr(rdram, dest);
                     if (host)
                     {
-                        // Zero-fill 2048*sectors for triage; real data would come from GAMEDATA.WAD LBN mapping.
-                        std::memset(host, 0, sectors * 2048u);
+                        // Try host WAD file at game_data/GAMEDATA.WAD (first WAD).
+                        // LBN 0x540000 is beyond single WAD size (10 GiB vs 400 MB),
+                        // so LBN is likely not direct byte offset; use filelist.dir
+                        // mapping or just read from WAD at offset 0 for triage.
+                        // For Cycle 11: attempt to read from GAMEDATA.WAD at offset 0,
+                        // fallback to zero-fill. This proves file I/O path works.
+                        static std::once_flag s_logOnce;
+                        std::call_once(s_logOnce, [&]() {
+                            (void)rt;
+                            // Log once to run_log for debugging (ps2_log if enabled)
+                        });
+                        // Attempt host read: open game_data/GAMEDATA.WAD and read sectors*2048 at offset 0
+                        // (real LBN->file mapping via filelist.dir would be next step).
+                        const char *candidates[] = {
+                            "game_data/GAMEDATA.WAD",
+                            "C:\\Projects\\shaolin-monks-recomp\\game_data\\GAMEDATA.WAD",
+                            nullptr
+                        };
+                        bool readOk = false;
+                        for (int ci = 0; candidates[ci] != nullptr; ++ci)
+                        {
+                            FILE *f = std::fopen(candidates[ci], "rb");
+                            if (!f) continue;
+                            std::fseek(f, 0, SEEK_END);
+                            long fsize = std::ftell(f);
+                            std::fseek(f, 0, SEEK_SET);
+                            size_t want = sectors * 2048u;
+                            // Clamp to file size, read at offset 0 for now (real LBN mapping TODO)
+                            size_t toRead = want;
+                            if ((long)toRead > fsize) toRead = (size_t)fsize;
+                            size_t got = std::fread(host, 1, toRead, f);
+                            std::fclose(f);
+                            if (got > 0)
+                            {
+                                if (got < want) std::memset(host + got, 0, want - got);
+                                readOk = true;
+                                handled = true;
+                                break;
+                            }
+                        }
+                        if (!readOk)
+                        {
+                            // Fallback triage: zero-fill
+                            std::memset(host, 0, sectors * 2048u);
+                            handled = true;
+                        }
                     }
                 }
+                (void)lsn;
+                (void)handled;
                 ps2_stubs::ret1(rdram, ctx, rt);
                 if (ctx->pc == entryPc)
                 {
