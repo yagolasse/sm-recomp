@@ -46,6 +46,22 @@ namespace
                     ctx->pc = getRegU32(ctx, 31);
                 }
             });
+        // 0x385ce0: whole-function bypass for sceCdLayerSearchFile@0x385CE0.
+        // The outer 0x385da0->0x385db4->0x385dbc->0x385de0->0x385da0 retry loop
+        // polls sceSifBindRpc (0x4834E0) + flags -0x2070(s4)/0x24(s0). Bypassing
+        // inner delays alone didn't help (Cycle 3). Try whole-function ret0 triage
+        // per Walkthrough §6 (ret0 first, then ret1/reta0 if caller branches wrong
+        // at 0x385d30/0x385d4c/0x385e04/0x385f64).
+        runtime.registerFunction(0x00385CE0u,
+            [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+            {
+                const uint32_t entryPc = ctx->pc;
+                ps2_stubs::ret0(rdram, ctx, rt);
+                if (ctx->pc == entryPc)
+                {
+                    ctx->pc = getRegU32(ctx, 31);
+                }
+            });
         // Keep SifBindRpc triage via TOML ret1@0x4834E0 (see game.toml).
     }
 }
