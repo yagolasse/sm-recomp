@@ -5,9 +5,14 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 namespace
 {
+    // Remember last file requested via sceCdLayerSearchFile@0x385CE0 so sceCdRead@0x467940 can open correct host file.
+    static std::string g_lastCdFile = "GAMEDATA.WAD";
+    static std::mutex g_lastCdFileMutex;
+
     void applyShaolinMonksOverrides(PS2Runtime &runtime)
     {
         // 0x385d80: counted delay loop inside sceCdLayerSearchFile@0x385CE0
@@ -63,32 +68,51 @@ namespace
                 // a0 = char* name, a1 = sceCdlFILE* out
                 uint32_t namePtr = getRegU32(ctx, 4);
                 uint32_t filePtr = getRegU32(ctx, 5);
+                std::string reqName = "GAMEDATA.WAD";
+                if (namePtr != 0)
+                {
+                    uint8_t *nameHost = getMemPtr(rdram, namePtr);
+                    if (nameHost)
+                    {
+                        char tmp[64] = {};
+                        std::strncpy(tmp, reinterpret_cast<char*>(nameHost), 60);
+                        if (tmp[0] != '\0')
+                        {
+                            reqName = tmp;
+                            // Normalize: strip "cdrom0:\\" prefix, ;1 suffix, and \\ -> /
+                            if (reqName.rfind("cdrom0:", 0) == 0) reqName = reqName.substr(7);
+                            if (!reqName.empty() && reqName[0] == '\\') reqName = reqName.substr(1);
+                            auto sc = reqName.find(';');
+                            if (sc != std::string::npos) reqName = reqName.substr(0, sc);
+                            for (auto &c : reqName) if (c == '\\') c = '/';
+                            {
+                                std::lock_guard<std::mutex> lk(g_lastCdFileMutex);
+                                g_lastCdFile = reqName;
+                            }
+                        }
+                    }
+                }
                 if (filePtr != 0)
                 {
                     uint8_t *fileHost = getMemPtr(rdram, filePtr);
                     if (fileHost)
                     {
-                        // Zero the struct first (32 bytes typical for sceCdlFILE)
                         std::memset(fileHost, 0, 32);
-                        // Set lsn and size to plausible values for GAMEDATA.WAD
-                        // Use a small LSN that maps to host file offset 0 via our sceCdRead handler
-                        // (sceCdRead handler will read from WAD at offset 0 regardless of LSN, so any LSN works for now)
-                        // Write lsn at 0, size at 4, copy name at 8
                         uint32_t *lsnOut = reinterpret_cast<uint32_t*>(fileHost);
                         uint32_t *sizeOut = reinterpret_cast<uint32_t*>(fileHost + 4);
-                        *lsnOut = 0x00100000u; // synthetic, will be handled by sceCdRead as offset 0
-                        *sizeOut = 407222272u; // GAMEDATA.WAD size
-                        if (namePtr != 0)
+                        // Use LSN 0 for offset 0 triage; sceCdRead will ignore LSN and read at 0 via g_lastCdFile
+                        *lsnOut = 0x00001000u;
+                        // Try to get real file size for requested file
+                        std::string hostPath;
                         {
-                            uint8_t *nameHost = getMemPtr(rdram, namePtr);
-                            if (nameHost)
-                            {
-                                // Copy up to 16 chars of requested name for debugging
-                                char tmp[32] = {};
-                                std::strncpy(tmp, reinterpret_cast<char*>(nameHost), 30);
-                                std::memcpy(fileHost + 8, tmp, 16);
-                            }
+                            std::lock_guard<std::mutex> lk(g_lastCdFileMutex);
+                            hostPath = std::string("game_data/") + g_lastCdFile;
                         }
+                        FILE *f = std::fopen(hostPath.c_str(), "rb");
+                        uint32_t fsize = 407222272u;
+                        if (f) { std::fseek(f,0,SEEK_END); long s=std::ftell(f); if(s>0) fsize=(uint32_t)s; std::fclose(f); }
+                        *sizeOut = fsize;
+                        std::memcpy(fileHost + 8, g_lastCdFile.c_str(), std::min<size_t>(16, g_lastCdFile.size()));
                     }
                 }
                 ps2_stubs::ret1(rdram, ctx, rt);
@@ -98,7 +122,7 @@ namespace
                 }
             });
         // 0x467940: sceCdRead@0x00467940 — Cycle 5 blocker LBN 0x540000 sectors 2
-        // dest a2=0x75c540 at pc=0x420020. Try host WAD mapping before zero-fill triage.
+        // dest a2=0x75c540 at pc=0x420020. Use g_lastCdFile from 0x385CE0 if available.
         runtime.registerFunction(0x00467940u,
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
@@ -112,36 +136,43 @@ namespace
                     uint8_t *host = getMemPtr(rdram, dest);
                     if (host)
                     {
-                        // Try host WAD file at game_data/GAMEDATA.WAD (first WAD).
-                        // LBN 0x540000 is beyond single WAD size (10 GiB vs 400 MB),
-                        // so LBN is likely not direct byte offset; use filelist.dir
-                        // mapping or just read from WAD at offset 0 for triage.
-                        // For Cycle 11: attempt to read from GAMEDATA.WAD at offset 0,
-                        // fallback to zero-fill. This proves file I/O path works.
-                        static std::once_flag s_logOnce;
-                        std::call_once(s_logOnce, [&]() {
-                            (void)rt;
-                            // Log once to run_log for debugging (ps2_log if enabled)
-                        });
-                        // Attempt host read: open game_data/GAMEDATA.WAD and read sectors*2048 at offset 0
-                        // (real LBN->file mapping via filelist.dir would be next step).
+                        std::string lastFile;
+                        {
+                            std::lock_guard<std::mutex> lk(g_lastCdFileMutex);
+                            lastFile = g_lastCdFile;
+                        }
+                        // Build candidate list: last requested file first, then fallbacks
+                        std::string cand1 = std::string("game_data/") + lastFile;
+                        std::string cand2 = std::string("C:\\Projects\\shaolin-monks-recomp\\game_data\\") + lastFile;
                         const char *candidates[] = {
+                            cand1.c_str(),
+                            cand2.c_str(),
                             "game_data/GAMEDATA.WAD",
                             "C:\\Projects\\shaolin-monks-recomp\\game_data\\GAMEDATA.WAD",
                             nullptr
                         };
                         bool readOk = false;
+                        // Use LSN as byte offset if plausible (< file size), else offset 0
                         for (int ci = 0; candidates[ci] != nullptr; ++ci)
                         {
                             FILE *f = std::fopen(candidates[ci], "rb");
                             if (!f) continue;
                             std::fseek(f, 0, SEEK_END);
                             long fsize = std::ftell(f);
-                            std::fseek(f, 0, SEEK_SET);
                             size_t want = sectors * 2048u;
-                            // Clamp to file size, read at offset 0 for now (real LBN mapping TODO)
+                            size_t lsnOff = (size_t)lsn * 2048u;
+                            size_t off = 0;
+                            if ((long)lsnOff < fsize && (long)(lsnOff + want) <= fsize)
+                            {
+                                off = lsnOff; // plausible direct LSN offset
+                            }
+                            else
+                            {
+                                off = 0; // triage fallback
+                            }
+                            std::fseek(f, (long)off, SEEK_SET);
                             size_t toRead = want;
-                            if ((long)toRead > fsize) toRead = (size_t)fsize;
+                            if ((long)(off + toRead) > fsize) toRead = (size_t)(fsize - (long)off);
                             size_t got = std::fread(host, 1, toRead, f);
                             std::fclose(f);
                             if (got > 0)
@@ -154,7 +185,6 @@ namespace
                         }
                         if (!readOk)
                         {
-                            // Fallback triage: zero-fill
                             std::memset(host, 0, sectors * 2048u);
                             handled = true;
                         }
