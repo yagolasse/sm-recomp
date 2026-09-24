@@ -15,79 +15,6 @@ namespace
     static std::string g_lastCdFile = "GAMEDATA.WAD";
     static std::mutex g_lastCdFileMutex;
 
-    // ---- PWF inner FS parsing (GAMEDATA.WAD) ----
-    // Header dump: 50 57 46 20 00 80 4F 80 02 00 00 00 E3 1B 00 00 00 00 00 19 00 08 ... (LE: magic 0x20574650, 0x804F8000, 2, 7139, 0x19000000, 0x800)
-    // WADCRC.BIN is 7139*4 CRC32. Table at offset 32 appears compressed/encrypted (no plaintext TIM2/MIDWAY/ELF, 26 PWFs inside). Real offsets not monotonic in raw dump.
-    // We keep a lazy once_flag parser that validates header and builds a best-effort inner file offset table. If table cannot be decoded, fallback is header+table+innerIdx*sector.
-    static std::once_flag g_pwfOnce;
-    static uint32_t g_pwfNumFiles = 0;
-    static uint32_t g_pwfHeaderSize = 32;
-    static bool g_pwfValid = false;
-    static std::vector<uint32_t> g_pwfOffsets;
-    static std::vector<uint32_t> g_pwfSizes;
-
-    static void initPwfTableOnce()
-    {
-        std::call_once(g_pwfOnce, []() {
-            const char *candidates[] = {
-                "game_data/GAMEDATA.WAD",
-                "C:\\Projects\\shaolin-monks-recomp\\game_data\\GAMEDATA.WAD",
-                nullptr
-            };
-            for (int ci = 0; candidates[ci] != nullptr; ++ci) {
-                FILE *f = std::fopen(candidates[ci], "rb");
-                if (!f) continue;
-                uint8_t hdr[32] = {};
-                size_t got = std::fread(hdr, 1, 32, f);
-                if (got < 32) { std::fclose(f); continue; }
-                // Check magic "PWF "
-                if (hdr[0] != 0x50 || hdr[1] != 0x57 || hdr[2] != 0x46 || hdr[3] != 0x20) { std::fclose(f); continue; }
-                uint32_t numFiles = (uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) | ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24);
-                if (numFiles == 0 || numFiles > 20000) { std::fclose(f); continue; }
-                g_pwfNumFiles = numFiles; // expect 7139
-                g_pwfHeaderSize = 32;
-                // Try to read table at offset 32. The dump shows at 32: 1c 00 80 f5 ... not monotonic offsets, likely compressed.
-                // Attempt to interpret as array of 7139 * 8-byte entries (offset, size) LE. Validate if offsets look plausible.
-                // If not plausible, we keep fallback linear scheme header+index*sector.
-                std::fseek(f, 0, SEEK_END);
-                long fsize = std::ftell(f);
-                std::fseek(f, 32, SEEK_SET);
-                const size_t stride = 8;
-                g_pwfOffsets.assign(numFiles, 0);
-                g_pwfSizes.assign(numFiles, 0);
-                bool plausible = true;
-                for (uint32_t i = 0; i < numFiles; ++i) {
-                    uint8_t ent[8] = {};
-                    if (std::fread(ent, 1, 8, f) != 8) { plausible = false; break; }
-                    uint32_t off = (uint32_t)ent[0] | ((uint32_t)ent[1] << 8) | ((uint32_t)ent[2] << 16) | ((uint32_t)ent[3] << 24);
-                    uint32_t sz  = (uint32_t)ent[4] | ((uint32_t)ent[5] << 8) | ((uint32_t)ent[6] << 16) | ((uint32_t)ent[7] << 24);
-                    // Heuristic: offset should be within file and size < 10MB and offset+size <= fsize if valid
-                    if (off > (uint32_t)fsize || sz > 10*1024*1024 || (sz != 0 && off + sz > (uint32_t)fsize)) {
-                        // Mark as implausible; we still store but will fallback
-                        // Check BE interpretation as alternative
-                        uint32_t offBe = (uint32_t)ent[3] | ((uint32_t)ent[2] << 8) | ((uint32_t)ent[1] << 16) | ((uint32_t)ent[0] << 24);
-                        uint32_t szBe  = (uint32_t)ent[7] | ((uint32_t)ent[6] << 8) | ((uint32_t)ent[5] << 16) | ((uint32_t)ent[4] << 24);
-                        if (offBe < (uint32_t)fsize && szBe < 10*1024*1024 && offBe + szBe <= (uint32_t)fsize) {
-                            off = offBe; sz = szBe;
-                        } else {
-                            plausible = false;
-                            // keep raw but will not use for inner offset (fallback)
-                        }
-                    }
-                    g_pwfOffsets[i] = off;
-                    g_pwfSizes[i] = sz;
-                }
-                std::fclose(f);
-                g_pwfValid = true;
-                // If table not plausible (our dump shows first entry off 0xf580001c ~ 4GB LE not plausible), keep numFiles but force fallback linear.
-                if (!plausible) {
-                    // Keep offsets but caller will ignore if off >= fsize or sz==0, fallback to header+index*2048
-                }
-                break;
-            }
-        });
-    }
-
     // filelist.dir has 15 entries (manifest, not LBN index). WADCRC.BIN is 7139 x CRC32 (at GAMEDATA.WAD+0x3 == 7139).
     // PWF header at GAMEDATA.WAD+0x0 ("PWF ") + 7139 entries suggests inner WAD filesystem, but CD LSN 0x540000
     // via sceCdLayerSearchFile bypass is synthetic (10.5 GiB). We map LSN to deterministic file index so sceCdRead
@@ -119,6 +46,74 @@ namespace
         uint32_t h = 0;
         for (unsigned char c : lower) h = h * 31u + c;
         return 15u + (h % 1000u);
+    }
+
+    // ---- PWF inner FS parsing (GAMEDATA.WAD) ----
+    // Header at offset 0: 50 57 46 20 ("PWF "), u32[1]=0x804F8000, u32[2]=2, u32[3]=7139 (numFiles),
+    // u32[4]=0x19000000 (419430400), u32[5]=0x800 (2048), headerSize=32, tableBytes=7139*8=57112.
+    // Table at +32: 7139 x {u32 off, u32 size} LE. Dump via python shows LE plausible 1535/7139
+    // (off < fsize && off+size <= fsize && size<10MB && off%2048==0), BE plausible 0/7139,
+    // LE 512-aligned also 1535/7139. First bytes 1c0080f5... but entries 4,8,9 are plausible
+    // (e.g., 0x13800/0xc8, 0xa7800/0x1000). Data at base 0xDF38 (57144) is zeros, +2048/+4096 is
+    // real compressed data. So table is partially compressed — keep fallback to base+innerIdx*2048.
+    // Valid iff any entry passes off < fsize && off+size <= fsize && size<10MB && (off%2048==0 || off%512==0).
+    static std::once_flag g_pwfOnce;
+    static uint32_t g_pwfNumFiles = 0;
+    static uint32_t g_pwfHeaderSize = 32;
+    static bool g_pwfValid = false;
+    static std::vector<uint32_t> g_pwfOffsets;
+    static std::vector<uint32_t> g_pwfSizes;
+
+    static void initPwfTableOnce()
+    {
+        std::call_once(g_pwfOnce, []() {
+            const char *candidates[] = {
+                "game_data/GAMEDATA.WAD",
+                "C:\\Projects\\shaolin-monks-recomp\\game_data\\GAMEDATA.WAD",
+                nullptr
+            };
+            for (int ci = 0; candidates[ci] != nullptr; ++ci) {
+                FILE *f = std::fopen(candidates[ci], "rb");
+                if (!f) continue;
+                uint8_t hdr[32] = {};
+                size_t got = std::fread(hdr, 1, 32, f);
+                if (got < 32) { std::fclose(f); continue; }
+                if (hdr[0] != 0x50 || hdr[1] != 0x57 || hdr[2] != 0x46 || hdr[3] != 0x20) { std::fclose(f); continue; }
+                uint32_t numFiles = (uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) | ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24);
+                if (numFiles == 0 || numFiles > 20000) { std::fclose(f); continue; }
+                g_pwfNumFiles = numFiles; // expect 7139
+                g_pwfHeaderSize = 32;
+                std::fseek(f, 0, SEEK_END);
+                long fsize = std::ftell(f);
+                std::fseek(f, 32, SEEK_SET);
+                g_pwfOffsets.assign(numFiles, 0);
+                g_pwfSizes.assign(numFiles, 0);
+                bool anyPlausible = false;
+                for (uint32_t i = 0; i < numFiles; ++i) {
+                    uint8_t ent[8] = {};
+                    if (std::fread(ent, 1, 8, f) != 8) break;
+                    uint32_t off = (uint32_t)ent[0] | ((uint32_t)ent[1] << 8) | ((uint32_t)ent[2] << 16) | ((uint32_t)ent[3] << 24);
+                    uint32_t sz  = (uint32_t)ent[4] | ((uint32_t)ent[5] << 8) | ((uint32_t)ent[6] << 16) | ((uint32_t)ent[7] << 24);
+                    // Validate plausibility per spec: off < fsize && off+size <= fsize && size <10MB && (off%2048==0 || off%512==0)
+                    bool plausible = (off < (uint32_t)fsize && sz < 10u*1024u*1024u && off + sz <= (uint32_t)fsize && ((off % 2048u) == 0u || (off % 512u) == 0u));
+                    if (!plausible) {
+                        // Try BE as alternative
+                        uint32_t offBe = (uint32_t)ent[3] | ((uint32_t)ent[2] << 8) | ((uint32_t)ent[1] << 16) | ((uint32_t)ent[0] << 24);
+                        uint32_t szBe  = (uint32_t)ent[7] | ((uint32_t)ent[6] << 8) | ((uint32_t)ent[5] << 16) | ((uint32_t)ent[4] << 24);
+                        if (offBe < (uint32_t)fsize && szBe < 10u*1024u*1024u && offBe + szBe <= (uint32_t)fsize && ((offBe % 2048u) == 0u || (offBe % 512u) == 0u)) {
+                            off = offBe; sz = szBe; plausible = true;
+                        }
+                    }
+                    g_pwfOffsets[i] = off;
+                    g_pwfSizes[i] = sz;
+                    if (plausible) anyPlausible = true;
+                }
+                std::fclose(f);
+                // Only mark valid if at least one entry is plausible (1535/7139 in GAMEDATA.WAD) — otherwise keep fallback (header-only).
+                g_pwfValid = anyPlausible;
+                break;
+            }
+        });
     }
 
     void applyShaolinMonksOverrides(PS2Runtime &runtime)
@@ -249,11 +244,10 @@ namespace
                     ctx->pc = getRegU32(ctx, 31);
                 }
             });
-        // 0x467940: sceCdRead@0x00467940 — Cycle 5 blocker LBN 0x540000 sectors 2
-        // dest a2=0x75c540 at pc=0x420020. Uses g_lastCdFile + PWF inner FS index for true WAD+innerOffset.
-        // filelist.dir 15 entries manifest; WADCRC.BIN 7139 CRCs; GAMEDATA.WAD header PWF at 0x00 (50 57 46 20, 0x804F8000, 2, 7139, 0x19000000, 0x800).
-        // Inner table at 32 appears compressed (no TIM2/MIDWAY/ELF strings, 26 PWFs), so raw entry parsing fallback to header+index*sector.
-        // LSN 0..14 -> outer WAD index via idxMap at offset 0; LSN >=0x1000 low 12 bits -> inner file index for GAMEDATA.WAD at innerOffset.
+        // 0x467940: sceCdRead@0x00467940 — Cycle 5 blocker LBN 0x540000 sectors 2 dest a2=0x75c540 at pc=0x420020.
+        // Uses g_lastCdFile + PWF inner FS. Header dump: 50 57 46 20, LE [541480784, 2152693760, 2, 7139, 419430400, 2048] at 0; table at 32 (7139*8=57112) LE plausible 1535/7139.
+        // Inner table partially compressed but 21% entries valid (off%2048==0 or 512). Task 2: initPwfTableOnce checks plausibility and sets g_pwfValid; sceCdRead uses innerIdx=(lsn-0x1000)%7139 -> g_pwfOffsets[innerIdx] if valid else base+innerIdx*2048.
+        // LSN 0..14 -> outer WAD idxMap at offset 0; LSN >=0x1000 -> inner PWF offset. Keeps ret1 guard.
         runtime.registerFunction(0x00467940u,
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
@@ -298,19 +292,13 @@ namespace
                             nullptr
                         };
                         bool readOk = false;
-                        // Compute inner file index for PWF case: lsn >=0x1000 is hashed file (getFileIndexForName gave hash), low 12 bits as inner index.
-                        // For true inner FS, lsn = 0x1000 + (hash%0x1000) -> innerIdx = (lsn - 0x1000) % g_pwfNumFiles if g_pwfValid.
-                        // Also handle direct inner idx when lsn is large plausible offset not in 0..14.
+                        // PWF inner file for LSN beyond fileIdx: lsn >=0x1000 -> innerIdx=(lsn-0x1000)%numFiles per task.
+                        // If g_pwfValid (any entry plausible: 1535/7139), use g_pwfOffsets[innerIdx] when valid, else fallback to base+innerIdx*2048 or fileIdx offset 0.
                         uint32_t innerIdx = 0;
                         bool isInner = false;
-                        if (g_pwfValid && g_pwfNumFiles > 0) {
-                            if (lsn >= 0x1000u && lsn < 0x1000u + 0x1000u) {
-                                innerIdx = (lsn - 0x1000u) % g_pwfNumFiles;
-                                isInner = true;
-                            } else if (lsn > 14u && lsn < 0x1000u) {
-                                // Direct inner index for testing (e.g., lsn=123 -> inner 123)
-                                if (lsn < g_pwfNumFiles) { innerIdx = lsn; isInner = true; }
-                            }
+                        if (g_pwfValid && g_pwfNumFiles > 0 && lsn >= 0x1000u) {
+                            innerIdx = (lsn - 0x1000u) % g_pwfNumFiles;
+                            isInner = true;
                         }
                         for (int ci = 0; candidates[ci] != nullptr; ++ci)
                         {
@@ -326,28 +314,26 @@ namespace
                             }
                             else if (isInner)
                             {
-                                // True LBN->WAD+innerOffset: use PWF table if valid entry, else fallback to header+table+innerIdx*sector
+                                // True LBN->WAD+innerOffset: try tblOff first (plausible: off < fsize && off+size <= fsize && off%2048==0||512, size<10MB), fallback to base+innerIdx*2048
                                 bool useTable = false;
                                 if (g_pwfValid && innerIdx < g_pwfOffsets.size() && innerIdx < g_pwfSizes.size()) {
                                     uint32_t tblOff = g_pwfOffsets[innerIdx];
                                     uint32_t tblSz = g_pwfSizes[innerIdx];
-                                    if (tblOff != 0 && tblOff < (uint32_t)fsize && tblSz != 0 && (size_t)tblOff + want <= (size_t)fsize) {
+                                    // Validate plausibility per spec: off < fsize && off+size <= fsize && size<10MB && (off%2048==0 || off%512==0)
+                                    if (tblOff != 0 && tblOff < (uint32_t)fsize && tblSz != 0 && tblSz < 10u*1024u*1024u && (size_t)tblOff + want <= (size_t)fsize && ((tblOff % 2048u) == 0u || (tblOff % 512u) == 0u)) {
                                         off = tblOff;
                                         useTable = true;
                                     }
                                 }
                                 if (!useTable) {
-                                    // Fallback: inner file 0 at header+table size, linear sector alignment. Table at 32 with 7139*8 ~57112 bytes if compressed fallback.
+                                    // Fallback: base = headerSize + tableBytes (32+7139*8=57144=0xDF38), then + innerIdx*2048
                                     size_t tableBytes = (size_t)g_pwfNumFiles * 8u;
                                     size_t base = (size_t)g_pwfHeaderSize + tableBytes;
-                                    // If base beyond file, use header only
                                     if (base >= (size_t)fsize) base = g_pwfHeaderSize;
                                     size_t innerOff = base + (size_t)innerIdx * 2048u;
-                                    // Clamp to file size
                                     if (innerOff < (size_t)fsize && innerOff + want <= (size_t)fsize) off = innerOff;
                                     else if (innerOff < (size_t)fsize) off = innerOff;
-                                    else off = 0; // fallback
-                                    // If still beyond, try lsn*2048 as last resort
+                                    else off = 0;
                                     if (off == 0) {
                                         size_t lsnOff = (size_t)lsn * 2048u;
                                         if ((long)lsnOff < fsize && (long)(lsnOff + want) <= fsize) off = lsnOff;
