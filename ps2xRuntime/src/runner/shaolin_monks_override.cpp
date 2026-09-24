@@ -59,6 +59,38 @@ namespace
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
                 const uint32_t entryPc = ctx->pc;
+                // Try to set sceCdlFILE at a1 (s2) for file name at a0 (s3).
+                // a0 = char* name, a1 = sceCdlFILE* out
+                uint32_t namePtr = getRegU32(ctx, 4);
+                uint32_t filePtr = getRegU32(ctx, 5);
+                if (filePtr != 0)
+                {
+                    uint8_t *fileHost = getMemPtr(rdram, filePtr);
+                    if (fileHost)
+                    {
+                        // Zero the struct first (32 bytes typical for sceCdlFILE)
+                        std::memset(fileHost, 0, 32);
+                        // Set lsn and size to plausible values for GAMEDATA.WAD
+                        // Use a small LSN that maps to host file offset 0 via our sceCdRead handler
+                        // (sceCdRead handler will read from WAD at offset 0 regardless of LSN, so any LSN works for now)
+                        // Write lsn at 0, size at 4, copy name at 8
+                        uint32_t *lsnOut = reinterpret_cast<uint32_t*>(fileHost);
+                        uint32_t *sizeOut = reinterpret_cast<uint32_t*>(fileHost + 4);
+                        *lsnOut = 0x00100000u; // synthetic, will be handled by sceCdRead as offset 0
+                        *sizeOut = 407222272u; // GAMEDATA.WAD size
+                        if (namePtr != 0)
+                        {
+                            uint8_t *nameHost = getMemPtr(rdram, namePtr);
+                            if (nameHost)
+                            {
+                                // Copy up to 16 chars of requested name for debugging
+                                char tmp[32] = {};
+                                std::strncpy(tmp, reinterpret_cast<char*>(nameHost), 30);
+                                std::memcpy(fileHost + 8, tmp, 16);
+                            }
+                        }
+                    }
+                }
                 ps2_stubs::ret1(rdram, ctx, rt);
                 if (ctx->pc == entryPc)
                 {
