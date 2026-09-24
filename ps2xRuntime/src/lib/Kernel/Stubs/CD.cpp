@@ -323,10 +323,19 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
-    void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static int sync_call_count = 0;
+    if (sync_call_count < 3)
     {
-        setReturnS32(ctx, 0); // 0 = completed/not busy
+        sync_call_count++;
+        setReturnS32(ctx, 1); // First 3 calls: busy
     }
+    else
+    {
+        setReturnS32(ctx, 0); // Then done
+    }
+}
 
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
