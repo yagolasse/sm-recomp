@@ -2,6 +2,7 @@
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -12,6 +13,39 @@ namespace
     // Remember last file requested via sceCdLayerSearchFile@0x385CE0 so sceCdRead@0x467940 can open correct host file.
     static std::string g_lastCdFile = "GAMEDATA.WAD";
     static std::mutex g_lastCdFileMutex;
+
+    // filelist.dir has 15 entries (manifest, not LBN index). WADCRC.BIN is 7139 x CRC32 (at GAMEDATA.WAD+0x3 == 7139).
+    // PWF header at GAMEDATA.WAD+0x0 ("PWF ") + 7139 entries suggests inner WAD filesystem, but CD LSN 0x540000
+    // via sceCdLayerSearchFile bypass is synthetic (10.5 GiB). We map LSN to deterministic file index so sceCdRead
+    // can open the correct host WAD at offset 0 (or lsn*2048 if plausible). See wiki §9 Phase 2.
+    static uint32_t getFileIndexForName(const std::string &normName)
+    {
+        // normName is already normalized: upper/lower preserved but \ -> / and ;1 stripped, cdrom0: stripped.
+        // Compare case-insensitive against filelist.dir order.
+        std::string lower = normName;
+        for (auto &c : lower) c = (char)std::tolower((unsigned char)c);
+        if (lower == "wadcrc.bin") return 0;
+        if (lower == "gamedata.wad") return 1;
+        if (lower == "gamedata.wae") return 2;
+        if (lower == "gamedata.waf") return 3;
+        if (lower == "gamedata.wag") return 4;
+        if (lower == "gamedata.wah") return 5;
+        if (lower == "gamedata.wai") return 6;
+        if (lower == "gamedata.waj") return 7;
+        if (lower == "front/movies/midway.sfd") return 8;
+        if (lower == "front/movies/opening.sfd") return 9;
+        if (lower == "front/movies/end006.sfd") return 10;
+        if (lower == "front/movies/end011.sfd") return 11;
+        if (lower == "front/movies/final.sfd") return 12;
+        if (lower == "front/movies/blitz.sfd") return 13;
+        if (lower == "front/movies/gauntlet.sfd") return 14;
+        // SYSTEM.CNF BOOT2 = cdrom0:\SLUS_210.87;1 is host ELF, not WAD. Map to 0xFFFF sentinel if needed.
+        if (lower == "slus_210.87") return 0x5A5Au;
+        // Fallback: hash to small index, keep deterministic but avoid colliding with 0..14
+        uint32_t h = 0;
+        for (unsigned char c : lower) h = h * 31u + c;
+        return 15u + (h % 1000u);
+    }
 
     void applyShaolinMonksOverrides(PS2Runtime &runtime)
     {
@@ -100,8 +134,21 @@ namespace
                         std::memset(fileHost, 0, 32);
                         uint32_t *lsnOut = reinterpret_cast<uint32_t*>(fileHost);
                         uint32_t *sizeOut = reinterpret_cast<uint32_t*>(fileHost + 4);
-                        // Use LSN 0 for offset 0 triage; sceCdRead will ignore LSN and read at 0 via g_lastCdFile
-                        *lsnOut = 0x00001000u;
+                        // Deterministic file index -> LSN mapping. filelist.dir is manifest only; WADCRC.BIN is
+                        // 7139 CRCs for inner PWF filesystem (GAMEDATA.WAD header PWF magic, u32[3]=7139). CD LSN
+                        // 0x540000*2048=10.5 GiB is synthetic garbage. Map to index so sceCdRead can open correct host file.
+                        std::string curFile;
+                        {
+                            std::lock_guard<std::mutex> lk(g_lastCdFileMutex);
+                            curFile = g_lastCdFile;
+                        }
+                        uint32_t fileIdx = getFileIndexForName(curFile);
+                        // Use index as LSN for GAMEDATA.WA* series; for non-WAD fall back to 0x1000 + index to keep offset 0 triage plausible
+                        uint32_t lsn = fileIdx;
+                        // Keep GAMEDATA.WAD at LSN 0 for zero-offset fast path; others at 1..7 also near zero (plausible < file size check in sceCdRead will fallback to 0 anyway)
+                        // For files > 15, use 0x1000 base to avoid colliding with real small offsets.
+                        if (fileIdx >= 15u) lsn = 0x00001000u + (fileIdx % 0x1000u);
+                        *lsnOut = lsn;
                         // Try to get real file size for requested file
                         std::string hostPath;
                         {
@@ -111,6 +158,13 @@ namespace
                         FILE *f = std::fopen(hostPath.c_str(), "rb");
                         uint32_t fsize = 407222272u;
                         if (f) { std::fseek(f,0,SEEK_END); long s=std::ftell(f); if(s>0) fsize=(uint32_t)s; std::fclose(f); }
+                        else
+                        {
+                            // Fallback: try absolute path
+                            std::string absPath = std::string("C:\\Projects\\shaolin-monks-recomp\\game_data\\") + curFile;
+                            FILE *f2 = std::fopen(absPath.c_str(), "rb");
+                            if (f2) { std::fseek(f2,0,SEEK_END); long s=std::ftell(f2); if(s>0) fsize=(uint32_t)s; std::fclose(f2); }
+                        }
                         *sizeOut = fsize;
                         std::memcpy(fileHost + 8, g_lastCdFile.c_str(), std::min<size_t>(16, g_lastCdFile.size()));
                     }
@@ -122,7 +176,11 @@ namespace
                 }
             });
         // 0x467940: sceCdRead@0x00467940 — Cycle 5 blocker LBN 0x540000 sectors 2
-        // dest a2=0x75c540 at pc=0x420020. Use g_lastCdFile from 0x385CE0 if available.
+        // dest a2=0x75c540 at pc=0x420020. Uses g_lastCdFile + deterministic LBN->WAD+offset mapping.
+        // filelist.dir is manifest (15 files); WADCRC.BIN is 7139 CRC32 for inner PWF FS (GAMEDATA.WAD header PWF, 7139 entries).
+        // LSN 0..14 map to file index (0 fallback would be ambiguous, so GAMEDATA.WAD=1 etc., but keep 1==GAMEDATA.WAD for offset 0).
+        // If LSN is small file index (e.g., 1 for GAMEDATA.WAD, 2 for WAE), we open correct WAD at offset 0 or lsn*2048 if plausible.
+        // If LSN is synthetic old 0x540000, fallback still reads offset 0 from last file (triange safety).
         runtime.registerFunction(0x00467940u,
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
@@ -141,18 +199,37 @@ namespace
                             std::lock_guard<std::mutex> lk(g_lastCdFileMutex);
                             lastFile = g_lastCdFile;
                         }
-                        // Build candidate list: last requested file first, then fallbacks
+                        // If LSN is small file index (1..14), it already encodes which WAD to open via getFileIndexForName.
+                        // Prefer lastFile, but also handle case where LSN index disagrees (e.g., game reuses stale lsn).
+                        // Build candidate list: last requested file first, then fallbacks by index.
                         std::string cand1 = std::string("game_data/") + lastFile;
                         std::string cand2 = std::string("C:\\Projects\\shaolin-monks-recomp\\game_data\\") + lastFile;
+                        // Reverse-map index 1..7 to WAD name for fallback if lastFile is stale
+                        std::string idxFile;
+                        if (lsn <= 14u)
+                        {
+                            static const char* idxMap[15] = {
+                                "WADCRC.BIN","GAMEDATA.WAD","GAMEDATA.WAE","GAMEDATA.WAF","GAMEDATA.WAG",
+                                "GAMEDATA.WAH","GAMEDATA.WAI","GAMEDATA.WAJ",
+                                "FRONT/MOVIES/MIDWAY.SFD","FRONT/MOVIES/OPENING.SFD","FRONT/MOVIES/END006.SFD",
+                                "FRONT/MOVIES/END011.SFD","FRONT/MOVIES/FINAL.SFD","FRONT/MOVIES/BLITZ.SFD","FRONT/MOVIES/GAUNTLET.SFD"
+                            };
+                            if (lsn < 15u) idxFile = idxMap[lsn];
+                        }
+                        std::string cand3 = idxFile.empty() ? std::string() : std::string("game_data/") + idxFile;
+                        std::string cand4 = idxFile.empty() ? std::string() : std::string("C:\\Projects\\shaolin-monks-recomp\\game_data\\") + idxFile;
                         const char *candidates[] = {
                             cand1.c_str(),
                             cand2.c_str(),
+                            cand3.empty() ? nullptr : cand3.c_str(),
+                            cand4.empty() ? nullptr : cand4.c_str(),
                             "game_data/GAMEDATA.WAD",
                             "C:\\Projects\\shaolin-monks-recomp\\game_data\\GAMEDATA.WAD",
                             nullptr
                         };
                         bool readOk = false;
-                        // Use LSN as byte offset if plausible (< file size), else offset 0
+                        // Proper LBN->WAD+offset: if lsn is file index 1..7 etc., offset 0 is correct file start.
+                        // If lsn is 0x1000+ range (hashed names), treat as offset 0 triage. If lsn*2048 < fsize, use it as intra-WAD offset.
                         for (int ci = 0; candidates[ci] != nullptr; ++ci)
                         {
                             FILE *f = std::fopen(candidates[ci], "rb");
@@ -160,15 +237,24 @@ namespace
                             std::fseek(f, 0, SEEK_END);
                             long fsize = std::ftell(f);
                             size_t want = sectors * 2048u;
-                            size_t lsnOff = (size_t)lsn * 2048u;
                             size_t off = 0;
-                            if ((long)lsnOff < fsize && (long)(lsnOff + want) <= fsize)
+                            // For small index LSN (1..14), the file is already selected by index, so read at 0.
+                            // For larger LSN, try as byte offset if plausible.
+                            if (lsn <= 14u)
                             {
-                                off = lsnOff; // plausible direct LSN offset
+                                off = 0;
                             }
                             else
                             {
-                                off = 0; // triage fallback
+                                size_t lsnOff = (size_t)lsn * 2048u;
+                                if ((long)lsnOff < fsize && (long)(lsnOff + want) <= fsize)
+                                {
+                                    off = lsnOff; // plausible intra-WAD offset (e.g., WAD internal FS would give larger LSN)
+                                }
+                                else
+                                {
+                                    off = 0; // triage fallback
+                                }
                             }
                             std::fseek(f, (long)off, SEEK_SET);
                             size_t toRead = want;
