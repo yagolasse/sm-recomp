@@ -97,7 +97,7 @@ namespace
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
                 const uint32_t entryPc = ctx->pc;
-                ps2_stubs::ret0(rdram, ctx, rt);
+                ps2_stubs::ret1(rdram, ctx, rt);
                 if (ctx->pc == entryPc)
                 {
                     ctx->pc = getRegU32(ctx, 31);
