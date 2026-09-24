@@ -7,12 +7,86 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace
 {
     // Remember last file requested via sceCdLayerSearchFile@0x385CE0 so sceCdRead@0x467940 can open correct host file.
     static std::string g_lastCdFile = "GAMEDATA.WAD";
     static std::mutex g_lastCdFileMutex;
+
+    // ---- PWF inner FS parsing (GAMEDATA.WAD) ----
+    // Header dump: 50 57 46 20 00 80 4F 80 02 00 00 00 E3 1B 00 00 00 00 00 19 00 08 ... (LE: magic 0x20574650, 0x804F8000, 2, 7139, 0x19000000, 0x800)
+    // WADCRC.BIN is 7139*4 CRC32. Table at offset 32 appears compressed/encrypted (no plaintext TIM2/MIDWAY/ELF, 26 PWFs inside). Real offsets not monotonic in raw dump.
+    // We keep a lazy once_flag parser that validates header and builds a best-effort inner file offset table. If table cannot be decoded, fallback is header+table+innerIdx*sector.
+    static std::once_flag g_pwfOnce;
+    static uint32_t g_pwfNumFiles = 0;
+    static uint32_t g_pwfHeaderSize = 32;
+    static bool g_pwfValid = false;
+    static std::vector<uint32_t> g_pwfOffsets;
+    static std::vector<uint32_t> g_pwfSizes;
+
+    static void initPwfTableOnce()
+    {
+        std::call_once(g_pwfOnce, []() {
+            const char *candidates[] = {
+                "game_data/GAMEDATA.WAD",
+                "C:\\Projects\\shaolin-monks-recomp\\game_data\\GAMEDATA.WAD",
+                nullptr
+            };
+            for (int ci = 0; candidates[ci] != nullptr; ++ci) {
+                FILE *f = std::fopen(candidates[ci], "rb");
+                if (!f) continue;
+                uint8_t hdr[32] = {};
+                size_t got = std::fread(hdr, 1, 32, f);
+                if (got < 32) { std::fclose(f); continue; }
+                // Check magic "PWF "
+                if (hdr[0] != 0x50 || hdr[1] != 0x57 || hdr[2] != 0x46 || hdr[3] != 0x20) { std::fclose(f); continue; }
+                uint32_t numFiles = (uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) | ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24);
+                if (numFiles == 0 || numFiles > 20000) { std::fclose(f); continue; }
+                g_pwfNumFiles = numFiles; // expect 7139
+                g_pwfHeaderSize = 32;
+                // Try to read table at offset 32. The dump shows at 32: 1c 00 80 f5 ... not monotonic offsets, likely compressed.
+                // Attempt to interpret as array of 7139 * 8-byte entries (offset, size) LE. Validate if offsets look plausible.
+                // If not plausible, we keep fallback linear scheme header+index*sector.
+                std::fseek(f, 0, SEEK_END);
+                long fsize = std::ftell(f);
+                std::fseek(f, 32, SEEK_SET);
+                const size_t stride = 8;
+                g_pwfOffsets.assign(numFiles, 0);
+                g_pwfSizes.assign(numFiles, 0);
+                bool plausible = true;
+                for (uint32_t i = 0; i < numFiles; ++i) {
+                    uint8_t ent[8] = {};
+                    if (std::fread(ent, 1, 8, f) != 8) { plausible = false; break; }
+                    uint32_t off = (uint32_t)ent[0] | ((uint32_t)ent[1] << 8) | ((uint32_t)ent[2] << 16) | ((uint32_t)ent[3] << 24);
+                    uint32_t sz  = (uint32_t)ent[4] | ((uint32_t)ent[5] << 8) | ((uint32_t)ent[6] << 16) | ((uint32_t)ent[7] << 24);
+                    // Heuristic: offset should be within file and size < 10MB and offset+size <= fsize if valid
+                    if (off > (uint32_t)fsize || sz > 10*1024*1024 || (sz != 0 && off + sz > (uint32_t)fsize)) {
+                        // Mark as implausible; we still store but will fallback
+                        // Check BE interpretation as alternative
+                        uint32_t offBe = (uint32_t)ent[3] | ((uint32_t)ent[2] << 8) | ((uint32_t)ent[1] << 16) | ((uint32_t)ent[0] << 24);
+                        uint32_t szBe  = (uint32_t)ent[7] | ((uint32_t)ent[6] << 8) | ((uint32_t)ent[5] << 16) | ((uint32_t)ent[4] << 24);
+                        if (offBe < (uint32_t)fsize && szBe < 10*1024*1024 && offBe + szBe <= (uint32_t)fsize) {
+                            off = offBe; sz = szBe;
+                        } else {
+                            plausible = false;
+                            // keep raw but will not use for inner offset (fallback)
+                        }
+                    }
+                    g_pwfOffsets[i] = off;
+                    g_pwfSizes[i] = sz;
+                }
+                std::fclose(f);
+                g_pwfValid = true;
+                // If table not plausible (our dump shows first entry off 0xf580001c ~ 4GB LE not plausible), keep numFiles but force fallback linear.
+                if (!plausible) {
+                    // Keep offsets but caller will ignore if off >= fsize or sz==0, fallback to header+index*2048
+                }
+                break;
+            }
+        });
+    }
 
     // filelist.dir has 15 entries (manifest, not LBN index). WADCRC.BIN is 7139 x CRC32 (at GAMEDATA.WAD+0x3 == 7139).
     // PWF header at GAMEDATA.WAD+0x0 ("PWF ") + 7139 entries suggests inner WAD filesystem, but CD LSN 0x540000
@@ -176,11 +250,10 @@ namespace
                 }
             });
         // 0x467940: sceCdRead@0x00467940 — Cycle 5 blocker LBN 0x540000 sectors 2
-        // dest a2=0x75c540 at pc=0x420020. Uses g_lastCdFile + deterministic LBN->WAD+offset mapping.
-        // filelist.dir is manifest (15 files); WADCRC.BIN is 7139 CRC32 for inner PWF FS (GAMEDATA.WAD header PWF, 7139 entries).
-        // LSN 0..14 map to file index (0 fallback would be ambiguous, so GAMEDATA.WAD=1 etc., but keep 1==GAMEDATA.WAD for offset 0).
-        // If LSN is small file index (e.g., 1 for GAMEDATA.WAD, 2 for WAE), we open correct WAD at offset 0 or lsn*2048 if plausible.
-        // If LSN is synthetic old 0x540000, fallback still reads offset 0 from last file (triange safety).
+        // dest a2=0x75c540 at pc=0x420020. Uses g_lastCdFile + PWF inner FS index for true WAD+innerOffset.
+        // filelist.dir 15 entries manifest; WADCRC.BIN 7139 CRCs; GAMEDATA.WAD header PWF at 0x00 (50 57 46 20, 0x804F8000, 2, 7139, 0x19000000, 0x800).
+        // Inner table at 32 appears compressed (no TIM2/MIDWAY/ELF strings, 26 PWFs), so raw entry parsing fallback to header+index*sector.
+        // LSN 0..14 -> outer WAD index via idxMap at offset 0; LSN >=0x1000 low 12 bits -> inner file index for GAMEDATA.WAD at innerOffset.
         runtime.registerFunction(0x00467940u,
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
@@ -189,6 +262,7 @@ namespace
                 const uint32_t sectors = getRegU32(ctx, 5); // a1
                 const uint32_t dest = getRegU32(ctx, 6); // a2
                 bool handled = false;
+                initPwfTableOnce();
                 if (dest != 0 && sectors != 0 && sectors < 0x1000)
                 {
                     uint8_t *host = getMemPtr(rdram, dest);
@@ -199,12 +273,6 @@ namespace
                             std::lock_guard<std::mutex> lk(g_lastCdFileMutex);
                             lastFile = g_lastCdFile;
                         }
-                        // If LSN is small file index (1..14), it already encodes which WAD to open via getFileIndexForName.
-                        // Prefer lastFile, but also handle case where LSN index disagrees (e.g., game reuses stale lsn).
-                        // Build candidate list: last requested file first, then fallbacks by index.
-                        std::string cand1 = std::string("game_data/") + lastFile;
-                        std::string cand2 = std::string("C:\\Projects\\shaolin-monks-recomp\\game_data\\") + lastFile;
-                        // Reverse-map index 1..7 to WAD name for fallback if lastFile is stale
                         std::string idxFile;
                         if (lsn <= 14u)
                         {
@@ -216,6 +284,8 @@ namespace
                             };
                             if (lsn < 15u) idxFile = idxMap[lsn];
                         }
+                        std::string cand1 = std::string("game_data/") + lastFile;
+                        std::string cand2 = std::string("C:\\Projects\\shaolin-monks-recomp\\game_data\\") + lastFile;
                         std::string cand3 = idxFile.empty() ? std::string() : std::string("game_data/") + idxFile;
                         std::string cand4 = idxFile.empty() ? std::string() : std::string("C:\\Projects\\shaolin-monks-recomp\\game_data\\") + idxFile;
                         const char *candidates[] = {
@@ -228,8 +298,20 @@ namespace
                             nullptr
                         };
                         bool readOk = false;
-                        // Proper LBN->WAD+offset: if lsn is file index 1..7 etc., offset 0 is correct file start.
-                        // If lsn is 0x1000+ range (hashed names), treat as offset 0 triage. If lsn*2048 < fsize, use it as intra-WAD offset.
+                        // Compute inner file index for PWF case: lsn >=0x1000 is hashed file (getFileIndexForName gave hash), low 12 bits as inner index.
+                        // For true inner FS, lsn = 0x1000 + (hash%0x1000) -> innerIdx = (lsn - 0x1000) % g_pwfNumFiles if g_pwfValid.
+                        // Also handle direct inner idx when lsn is large plausible offset not in 0..14.
+                        uint32_t innerIdx = 0;
+                        bool isInner = false;
+                        if (g_pwfValid && g_pwfNumFiles > 0) {
+                            if (lsn >= 0x1000u && lsn < 0x1000u + 0x1000u) {
+                                innerIdx = (lsn - 0x1000u) % g_pwfNumFiles;
+                                isInner = true;
+                            } else if (lsn > 14u && lsn < 0x1000u) {
+                                // Direct inner index for testing (e.g., lsn=123 -> inner 123)
+                                if (lsn < g_pwfNumFiles) { innerIdx = lsn; isInner = true; }
+                            }
+                        }
                         for (int ci = 0; candidates[ci] != nullptr; ++ci)
                         {
                             FILE *f = std::fopen(candidates[ci], "rb");
@@ -238,22 +320,50 @@ namespace
                             long fsize = std::ftell(f);
                             size_t want = sectors * 2048u;
                             size_t off = 0;
-                            // For small index LSN (1..14), the file is already selected by index, so read at 0.
-                            // For larger LSN, try as byte offset if plausible.
                             if (lsn <= 14u)
                             {
                                 off = 0;
+                            }
+                            else if (isInner)
+                            {
+                                // True LBN->WAD+innerOffset: use PWF table if valid entry, else fallback to header+table+innerIdx*sector
+                                bool useTable = false;
+                                if (g_pwfValid && innerIdx < g_pwfOffsets.size() && innerIdx < g_pwfSizes.size()) {
+                                    uint32_t tblOff = g_pwfOffsets[innerIdx];
+                                    uint32_t tblSz = g_pwfSizes[innerIdx];
+                                    if (tblOff != 0 && tblOff < (uint32_t)fsize && tblSz != 0 && (size_t)tblOff + want <= (size_t)fsize) {
+                                        off = tblOff;
+                                        useTable = true;
+                                    }
+                                }
+                                if (!useTable) {
+                                    // Fallback: inner file 0 at header+table size, linear sector alignment. Table at 32 with 7139*8 ~57112 bytes if compressed fallback.
+                                    size_t tableBytes = (size_t)g_pwfNumFiles * 8u;
+                                    size_t base = (size_t)g_pwfHeaderSize + tableBytes;
+                                    // If base beyond file, use header only
+                                    if (base >= (size_t)fsize) base = g_pwfHeaderSize;
+                                    size_t innerOff = base + (size_t)innerIdx * 2048u;
+                                    // Clamp to file size
+                                    if (innerOff < (size_t)fsize && innerOff + want <= (size_t)fsize) off = innerOff;
+                                    else if (innerOff < (size_t)fsize) off = innerOff;
+                                    else off = 0; // fallback
+                                    // If still beyond, try lsn*2048 as last resort
+                                    if (off == 0) {
+                                        size_t lsnOff = (size_t)lsn * 2048u;
+                                        if ((long)lsnOff < fsize && (long)(lsnOff + want) <= fsize) off = lsnOff;
+                                    }
+                                }
                             }
                             else
                             {
                                 size_t lsnOff = (size_t)lsn * 2048u;
                                 if ((long)lsnOff < fsize && (long)(lsnOff + want) <= fsize)
                                 {
-                                    off = lsnOff; // plausible intra-WAD offset (e.g., WAD internal FS would give larger LSN)
+                                    off = lsnOff;
                                 }
                                 else
                                 {
-                                    off = 0; // triage fallback
+                                    off = 0;
                                 }
                             }
                             std::fseek(f, (long)off, SEEK_SET);
