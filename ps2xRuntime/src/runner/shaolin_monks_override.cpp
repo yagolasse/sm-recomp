@@ -86,11 +86,14 @@ namespace
                     ctx->pc = getRegU32(ctx, 31);
                 }
             });
-        // 0x24cdd4: CD-read poll loop reached after sceCdRead@0x467940 LBN 0x540000
-        // (Cycle 5: ret1 at 0x385ce0 -> PC 0x24cdd4, then stuck with sceCdRead
-        // zero-fill triage at 0x467940 still stuck). Bypass the poll loop
-        // per Walkthrough §5 Blocker D — directly return to caller.
-        runtime.registerFunction(0x0024CDD4u,
+        // 0x24cdc0/0x24cdd4: CD-read poll loop epilogue in sub_0024CDC0
+        // Cycle 6 ret0 at 0x24cdd4 looped (ra==pc), Cycle 7 whole-function at
+        // 0x24cdc0 made ticks disappear (no 0x24cdd4 after 3000). Revert to
+        // minimal: handle sceGsSyncV@0x206030 (jal at 0x24cdcc) which this
+        // function calls. The poll loop likely waits for vsync.
+        // Keep only sceCdRead@0x467940 triage; remove 0x24cdd4/0x24cdc0
+        // overrides that suppressed ticks. Instead, stub sceGsSyncV.
+        runtime.registerFunction(0x00206030u,
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
                 const uint32_t entryPc = ctx->pc;
