@@ -62,6 +62,44 @@ namespace
                     ctx->pc = getRegU32(ctx, 31);
                 }
             });
+        // 0x467940: sceCdRead@0x00467940 — Cycle 5 blocker LBN 0x540000 sectors 2
+        // dest a2=0x75c540 at pc=0x420020. Runtime's CD.cpp needs a CD image;
+        // triage: zero-fill dest and return 1 (success) per Walkthrough §6.
+        runtime.registerFunction(0x00467940u,
+            [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+            {
+                const uint32_t entryPc = ctx->pc;
+                const uint32_t dest = getRegU32(ctx, 6); // a2
+                const uint32_t sectors = getRegU32(ctx, 5); // a1
+                if (dest != 0 && sectors != 0 && sectors < 0x1000)
+                {
+                    uint8_t *host = getMemPtr(rdram, dest);
+                    if (host)
+                    {
+                        // Zero-fill 2048*sectors for triage; real data would come from GAMEDATA.WAD LBN mapping.
+                        std::memset(host, 0, sectors * 2048u);
+                    }
+                }
+                ps2_stubs::ret1(rdram, ctx, rt);
+                if (ctx->pc == entryPc)
+                {
+                    ctx->pc = getRegU32(ctx, 31);
+                }
+            });
+        // 0x24cdd4: CD-read poll loop reached after sceCdRead@0x467940 LBN 0x540000
+        // (Cycle 5: ret1 at 0x385ce0 -> PC 0x24cdd4, then stuck with sceCdRead
+        // zero-fill triage at 0x467940 still stuck). Bypass the poll loop
+        // per Walkthrough §5 Blocker D — directly return to caller.
+        runtime.registerFunction(0x0024CDD4u,
+            [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+            {
+                const uint32_t entryPc = ctx->pc;
+                ps2_stubs::ret0(rdram, ctx, rt);
+                if (ctx->pc == entryPc)
+                {
+                    ctx->pc = getRegU32(ctx, 31);
+                }
+            });
         // Keep SifBindRpc triage via TOML ret1@0x4834E0 (see game.toml).
     }
 }
