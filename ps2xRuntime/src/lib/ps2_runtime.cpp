@@ -2418,6 +2418,21 @@ void PS2Runtime::run()
                                                << " vif=" << curVif
                                                << std::endl);
 
+                if ((tick % 1200) == 0)
+                {
+                    for (const auto &th : eeSnapshot.threads)
+                    {
+                        RUNTIME_LOG("[thread:state] id=" << std::dec << th.id
+                                                         << " pc=0x" << std::hex << th.pc
+                                                         << " entry=0x" << th.entry
+                                                         << std::dec
+                                                         << " status=" << static_cast<int>(th.status)
+                                                         << " prio=" << th.currentPriority
+                                                         << " waitReason=" << static_cast<int>(th.waitReason)
+                                                         << " waitId=0x" << std::hex << th.waitId << std::dec
+                                                         << std::endl);
+                    }
+                }
             }
         });
         uint32_t presentWidth = FB_WIDTH;
