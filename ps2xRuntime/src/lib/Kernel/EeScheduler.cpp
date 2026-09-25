@@ -423,7 +423,10 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // PS2 EE thread priorities are 0..127 (the main thread itself runs at priority 0, see
+    // initialize()). Rejecting priority 0 here wrongly refused every game thread that uses it
+    // (id=-403 / KE_ILLEGAL_PRIORITY), leaving only the main thread runnable.
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -701,7 +704,7 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
+    if (priority < 0 || priority >= kPriorityCount) // priority 0 is valid on PS2 (see createThread)
     {
         return KE_ILLEGAL_PRIORITY;
     }

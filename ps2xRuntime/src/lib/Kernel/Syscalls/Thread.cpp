@@ -230,7 +230,13 @@ namespace ps2_syscalls
             param->initial_priority,
             param->option,
         };
-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
+        const int createdId = scheduler(rdram, ctx, runtime).createThread(decoded);
+        RUNTIME_LOG("[thread:create] id=" << std::dec << createdId
+                                          << " func=0x" << std::hex << param->func
+                                          << " prio=" << std::dec << static_cast<int>(param->initial_priority)
+                                          << " stack=0x" << std::hex << param->stack
+                                          << " ssize=0x" << static_cast<uint32_t>(param->stack_size) << std::dec);
+        setReturnS32(ctx, createdId);
     }
 
     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -266,8 +272,14 @@ namespace ps2_syscalls
             setReturnS32(ctx, KE_NOT_DORMANT);
             return;
         }
+        RUNTIME_LOG("[thread:start] id=" << std::dec << id
+                                         << " entry=0x" << std::hex << target->entry
+                                         << " hasFn=" << std::dec << (runtime->hasFunction(target->entry) ? 1 : 0));
         if (!runtime->hasFunction(target->entry))
         {
+            RUNTIME_LOG("[thread:start] FAIL id=" << std::dec << id
+                                                  << " entry=0x" << std::hex << target->entry
+                                                  << " not a registered function" << std::dec);
             setReturnS32(ctx, KE_ERROR);
             return;
         }
