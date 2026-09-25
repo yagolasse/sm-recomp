@@ -9,160 +9,211 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // =====================================================================================
 // Shaolin Monks (SLUS_210.87) game overrides.
 //
-// History (see PROGRESS.md / AGENTS.md): early boot hung inside sceCdLayerSearchFile
-// (0x385CE0) and a vsync wait (sceGsSyncV @ 0x206030). Those were bypassed with ret1
-// triage so the game reaches its main loop. BUT diagnosis (2026-09-25) found the game
-// never renders anything (gsw=0, magenta framebuffer): the CD I/O stubs fed it
-// offset-0 / zero-filled data, so the consumer at 0x463EBC skips its 48-entry graphics
-// state init loop (it validates data at guest 0x75c540) and the render pipeline never
-// initialises.
+// A PCSX2 reference trace (2026-09-25) proved the earlier VCD approach was wrong: the
+// real game reads its retail disc's ISO9660 filesystem (LSN 16 = PVD, then directories)
+// and then real file data at true LSNs (67131, 203038, ...). Our old bypass fabricated
+// LSN 0x540000 (5.5M, past the end of the 1.7M-sector disc) and stalled the game.
 //
-// FIX: a coherent Virtual CD filesystem (VCD). The 15 on-disc files (filelist.dir order)
-// are laid out contiguously in a synthetic LSN space. sceCdLayerSearchFile returns a
-// file's base LSN + real size; sceCdRead maps ANY lsn back to (file, byteOffset) and
-// reads the real bytes from the extracted host file under game_data/. This means the
-// game gets correct data at correct offsets, including when it seeks by adding a sector
-// offset to the base LSN it got from the search call.
-//
-// Concise logging ([vcd] lines) is emitted (throttled) so CD traffic is visible instead
-// of suppressed — prior cycles flew blind here.
+// FIX: back the CD calls with the real disc image (sm.iso, 1,706,768 sectors):
+//   - sceCdLayerSearchFile @0x385CE0: resolve the requested path against sm.iso's real
+//     ISO9660 filesystem and fill sceCdlFILE {lsn, size} with the TRUE on-disc LSN.
+//   - sceCdRead @0x467940: serve sectors straight from sm.iso at lsn*2048.
+// This makes every read hit the correct disc data, exactly like real hardware.
 // =====================================================================================
 
 namespace
 {
-    // Last file requested via sceCdLayerSearchFile — kept for diagnostics only now.
-    static std::string g_lastCdFile = "GAMEDATA.WAD";
-    static std::mutex g_lastCdFileMutex;
-
-    // ---- Shared host I/O helpers ----
-    static FILE *openHostFile(const std::string &relPath)
+    // ---- locate the retail disc image ----
+    static FILE *openIso()
     {
-        std::string cand1 = std::string("game_data/") + relPath;
-        FILE *f = std::fopen(cand1.c_str(), "rb");
-        if (f) return f;
-        std::string cand2 = std::string("C:\\Projects\\shaolin-monks-recomp\\game_data\\") + relPath;
-        return std::fopen(cand2.c_str(), "rb");
-    }
-
-    static bool getHostFileSize(const std::string &relPath, uint32_t &outSize)
-    {
-        FILE *f = openHostFile(relPath);
-        if (!f) return false;
-        std::fseek(f, 0, SEEK_END);
-        long s = std::ftell(f);
-        std::fclose(f);
-        if (s <= 0) return false;
-        outSize = static_cast<uint32_t>(s);
-        return true;
-    }
-
-    static bool readHostFileAt(const std::string &relPath, size_t offset, uint8_t *dest, size_t want, size_t &outGot)
-    {
-        FILE *f = openHostFile(relPath);
-        if (!f) return false;
-        std::fseek(f, 0, SEEK_END);
-        long fileSize = std::ftell(f);
-        if (fileSize <= 0 || offset >= static_cast<size_t>(fileSize)) { std::fclose(f); return false; }
-        size_t toRead = want;
-        if (offset + toRead > static_cast<size_t>(fileSize)) toRead = static_cast<size_t>(fileSize) - offset;
-        std::fseek(f, static_cast<long>(offset), SEEK_SET);
-        outGot = std::fread(dest, 1, toRead, f);
-        std::fclose(f);
-        return outGot > 0;
-    }
-
-    // ---- Virtual CD filesystem (VCD) ----
-    // filelist.dir order. Host files under game_data/ (Windows FS is case-insensitive,
-    // so FRONT/MOVIES/*.SFD resolves to the extracted Front/Movies/*.sfd).
-    static const char *const kVcdFiles[15] = {
-        "WADCRC.BIN", "GAMEDATA.WAD", "GAMEDATA.WAE", "GAMEDATA.WAF", "GAMEDATA.WAG",
-        "GAMEDATA.WAH", "GAMEDATA.WAI", "GAMEDATA.WAJ",
-        "FRONT/MOVIES/MIDWAY.SFD", "FRONT/MOVIES/OPENING.SFD", "FRONT/MOVIES/END006.SFD",
-        "FRONT/MOVIES/END011.SFD", "FRONT/MOVIES/FINAL.SFD", "FRONT/MOVIES/BLITZ.SFD",
-        "FRONT/MOVIES/GAUNTLET.SFD"};
-
-    struct VcdEntry
-    {
-        const char *name = nullptr;
-        uint32_t baseLsn = 0;
-        uint32_t sizeBytes = 0;
-        uint32_t sectors = 0; // ceil(sizeBytes / 2048)
-    };
-
-    static std::once_flag g_vcdOnce;
-    static std::vector<VcdEntry> g_vcd;
-
-    // GAMEDATA.WAD's retail disc base LBN is hardcoded in the game: at 0x41FF5C
-    // `lui $s3, 0x54` -> $s3 = 0x540000, which is passed to sceCdRead. So the game reads
-    // GAMEDATA.WAD data at disc LBN 0x540000 + innerSectorOffset. We anchor the VCD there
-    // so sceCdRead(0x540000 + n) maps to GAMEDATA.WAD[n * 2048].
-    static constexpr uint32_t kGamedataBaseLsn = 0x540000u; // index 1 (GAMEDATA.WAD)
-
-    static void initVcdOnce()
-    {
-        std::call_once(g_vcdOnce, []() {
-            uint32_t sizes[15] = {0};
-            uint32_t secs[15] = {0};
-            for (int i = 0; i < 15; ++i)
-            {
-                getHostFileSize(kVcdFiles[i], sizes[i]); // 0 if missing
-                secs[i] = (sizes[i] + 2047u) / 2048u;
-            }
-
-            uint32_t base[15] = {0};
-            base[1] = kGamedataBaseLsn;                                   // GAMEDATA.WAD anchored
-            uint32_t wadcrcSecs = (secs[0] > 0u ? secs[0] : 1u);         // WADCRC.BIN just before it
-            base[0] = (kGamedataBaseLsn > wadcrcSecs) ? (kGamedataBaseLsn - wadcrcSecs) : 0u;
-            uint32_t lsn = kGamedataBaseLsn + (secs[1] > 0u ? secs[1] : 1u);
-            for (int i = 2; i < 15; ++i)                                  // WAE..WAJ, SFDs after it
-            {
-                base[i] = lsn;
-                lsn += (secs[i] > 0u ? secs[i] : 1u);
-            }
-
-            g_vcd.reserve(15);
-            for (int i = 0; i < 15; ++i)
-            {
-                VcdEntry e;
-                e.name = kVcdFiles[i];
-                e.baseLsn = base[i];
-                e.sizeBytes = sizes[i];
-                e.sectors = secs[i];
-                g_vcd.push_back(e);
-                std::printf("[vcd] map %-26s lsn=%u..%u size=%u\n", e.name, e.baseLsn,
-                            e.baseLsn + (secs[i] > 0u ? secs[i] : 1u) - 1u, e.sizeBytes);
-            }
-            std::fflush(stdout);
-        });
-    }
-
-    static const VcdEntry *vcdFindByLsn(uint32_t lsn)
-    {
-        for (const auto &e : g_vcd)
-            if (e.sectors > 0u && lsn >= e.baseLsn && lsn < e.baseLsn + e.sectors)
-                return &e;
-        return nullptr;
-    }
-
-    static const VcdEntry *vcdFindByName(const std::string &norm)
-    {
-        std::string want = norm;
-        for (auto &c : want) c = static_cast<char>(std::tolower((unsigned char)c));
-        for (const auto &e : g_vcd)
+        static const char *const cands[] = {
+            "sm.iso",
+            "C:\\Projects\\shaolin-monks-recomp\\sm.iso",
+        };
+        for (const char *c : cands)
         {
-            std::string en = e.name;
-            for (auto &c : en) c = static_cast<char>(std::tolower((unsigned char)c));
-            if (en == want) return &e;
+            if (FILE *f = std::fopen(c, "rb"))
+                return f;
         }
         return nullptr;
     }
 
-    // Normalize a guest path: strip "cdrom0:" / leading '\\' / ";1" version; '\\' -> '/'.
+    static bool isoReadSectors(uint32_t lsn, uint32_t sectors, uint8_t *dst)
+    {
+        FILE *f = openIso();
+        if (!f)
+            return false;
+        if (std::fseek(f, static_cast<long long>(lsn) * 2048ll, SEEK_SET) != 0)
+        {
+            std::fclose(f);
+            return false;
+        }
+        const size_t want = static_cast<size_t>(sectors) * 2048u;
+        const size_t got = std::fread(dst, 1, want, f);
+        std::fclose(f);
+        if (got == 0)
+            return false;
+        if (got < want)
+            std::memset(dst + got, 0, want - got);
+        return true;
+    }
+
+    static uint32_t le32(const uint8_t *p)
+    {
+        return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+    }
+
+    // ---- minimal ISO9660 path -> (lsn, size) lookup against sm.iso ----
+    // Path is already normalized ("FRONT/MOVIES/MIDWAY.SFD", no cdrom0:/;1). Case-insensitive.
+    static std::mutex g_isoMutex;
+    static std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> g_isoCache;
+
+    static bool ieq(const std::string &a, const std::string &b)
+    {
+        if (a.size() != b.size())
+            return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i]))
+                return false;
+        return true;
+    }
+
+    static bool isoLookup(const std::string &normPath, uint32_t &outLsn, uint32_t &outSize)
+    {
+        {
+            std::lock_guard<std::mutex> lk(g_isoMutex);
+            auto it = g_isoCache.find(normPath);
+            if (it != g_isoCache.end())
+            {
+                outLsn = it->second.first;
+                outSize = it->second.second;
+                return true;
+            }
+        }
+
+        FILE *f = openIso();
+        if (!f)
+            return false;
+        auto readSec = [&](uint32_t lsn, uint8_t *buf) -> bool {
+            if (std::fseek(f, static_cast<long long>(lsn) * 2048ll, SEEK_SET) != 0)
+                return false;
+            return std::fread(buf, 1, 2048, f) == 2048;
+        };
+
+        uint8_t pvd[2048];
+        bool ok = false;
+        uint32_t foundLsn = 0, foundSize = 0;
+        if (readSec(16, pvd) && pvd[0] == 1 && std::memcmp(pvd + 1, "CD001", 5) == 0)
+        {
+            // Root directory record lives at PVD+156; extent LBA @+2 (LE), data length @+10 (LE).
+            uint32_t dirLba = le32(pvd + 156 + 2);
+            uint32_t dirSize = le32(pvd + 156 + 10);
+
+            // Split the normalized path into components.
+            std::vector<std::string> parts;
+            {
+                std::string cur;
+                for (char c : normPath)
+                {
+                    if (c == '/')
+                    {
+                        if (!cur.empty()) parts.push_back(cur);
+                        cur.clear();
+                    }
+                    else
+                        cur.push_back(c);
+                }
+                if (!cur.empty()) parts.push_back(cur);
+            }
+
+            bool pathOk = !parts.empty();
+            for (size_t pi = 0; pi < parts.size() && pathOk; ++pi)
+            {
+                const bool isLast = (pi + 1 == parts.size());
+                const uint32_t secCount = (dirSize + 2047u) / 2048u;
+                std::vector<uint8_t> dir(static_cast<size_t>(secCount) * 2048u, 0);
+                for (uint32_t s = 0; s < secCount; ++s)
+                {
+                    if (!readSec(dirLba + s, dir.data() + static_cast<size_t>(s) * 2048u))
+                    {
+                        pathOk = false;
+                        break;
+                    }
+                }
+                if (!pathOk)
+                    break;
+
+                bool matched = false;
+                uint32_t off = 0;
+                while (off < dirSize)
+                {
+                    const uint8_t recLen = dir[off];
+                    if (recLen == 0)
+                    {
+                        // Directory records do not span sector boundaries; skip padding.
+                        off = ((off / 2048u) + 1u) * 2048u;
+                        continue;
+                    }
+                    const uint32_t recLba = le32(&dir[off + 2]);
+                    const uint32_t recSize = le32(&dir[off + 10]);
+                    const uint8_t flags = dir[off + 25];
+                    const uint8_t nameLen = dir[off + 32];
+                    // Skip "." (0x00) and ".." (0x01) special entries.
+                    if (!(nameLen == 1 && (dir[off + 33] == 0x00 || dir[off + 33] == 0x01)))
+                    {
+                        std::string name(reinterpret_cast<char *>(&dir[off + 33]), nameLen);
+                        auto sc = name.find(';');
+                        if (sc != std::string::npos)
+                            name = name.substr(0, sc);
+                        if (ieq(name, parts[pi]))
+                        {
+                            const bool isDir = (flags & 0x02) != 0;
+                            if (isLast && !isDir)
+                            {
+                                foundLsn = recLba;
+                                foundSize = recSize;
+                                ok = true;
+                                matched = true;
+                                break;
+                            }
+                            if (!isLast && isDir)
+                            {
+                                dirLba = recLba;
+                                dirSize = recSize;
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                    off += recLen;
+                }
+                if (!matched)
+                {
+                    pathOk = false;
+                    break;
+                }
+            }
+        }
+        std::fclose(f);
+
+        if (ok)
+        {
+            std::lock_guard<std::mutex> lk(g_isoMutex);
+            g_isoCache[normPath] = {foundLsn, foundSize};
+            outLsn = foundLsn;
+            outSize = foundSize;
+        }
+        return ok;
+    }
+
+    // Normalize a guest path: strip "cdrom0:" / "host:" / leading slash / ";1" version; '\\' -> '/'.
     static std::string normalizeGuestPath(const char *raw)
     {
         std::string s = raw ? raw : "";
@@ -176,11 +227,12 @@ namespace
     }
 
     static std::atomic<uint32_t> g_cdReadLogCount{0};
-    static constexpr uint32_t kCdReadLogCap = 200u; // throttle read logging
+    static constexpr uint32_t kCdReadLogCap = 200u;
 
     void applyShaolinMonksOverrides(PS2Runtime &runtime)
     {
-        // --- inner counted delay loops inside sceCdLayerSearchFile: bypass (return to caller) ---
+        // Inner counted delay loops inside sceCdLayerSearchFile: harmless safety bypass
+        // (never reached now that 0x385CE0 returns at entry, but kept in case of direct entry).
         auto bypassDelay = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
             const uint32_t entryPc = ctx->pc;
             ps2_stubs::ret0(rdram, ctx, rt);
@@ -190,41 +242,37 @@ namespace
         runtime.registerFunction(0x00385DE0u, bypassDelay);
         runtime.registerFunction(0x00385E40u, bypassDelay);
 
-        // --- sceCdLayerSearchFile @ 0x385CE0: resolve name -> VCD entry, fill sceCdlFILE, ret1 ---
-        // sceCdlFILE layout: { u32 lsn; u32 size; char name[16]; u8 date[8]; }  (a0=name, a1=out).
+        // sceCdLayerSearchFile @0x385CE0: real ISO9660 lookup against sm.iso.
+        // Verified from game code: a0(s3)=sceCdlFILE* out (written at +32/+35), a1(s2)=name
+        // (byte-loaded at 0x385e20). sceCdlFILE: { u32 lsn; u32 size; char name[16]; u8 date[8]; }
         runtime.registerFunction(0x00385CE0u,
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
                 const uint32_t entryPc = ctx->pc;
-                initVcdOnce();
+                const uint32_t filePtr = getRegU32(ctx, 4); // a0 = sceCdlFILE* out
+                const uint32_t namePtr = getRegU32(ctx, 5); // a1 = const char* name
 
-                const uint32_t namePtr = getRegU32(ctx, 4); // a0
-                const uint32_t filePtr = getRegU32(ctx, 5); // a1
-
-                std::string reqName = "GAMEDATA.WAD";
+                std::string reqName;
                 if (namePtr != 0)
                 {
                     if (uint8_t *nameHost = getMemPtr(rdram, namePtr))
                     {
-                        char tmp[80] = {};
-                        std::strncpy(tmp, reinterpret_cast<char *>(nameHost), 79);
-                        if (tmp[0] != '\0') reqName = normalizeGuestPath(tmp);
+                        char tmp[96] = {};
+                        std::strncpy(tmp, reinterpret_cast<char *>(nameHost), 95);
+                        reqName = normalizeGuestPath(tmp);
                     }
                 }
 
-                const VcdEntry *e = vcdFindByName(reqName);
-                if (!e && !g_vcd.empty()) e = &g_vcd[1]; // default to GAMEDATA.WAD
-                const uint32_t lsn = e ? e->baseLsn : 16u;
-                const uint32_t size = e ? e->sizeBytes : 0u;
+                uint32_t lsn = 0, size = 0;
+                const bool found = !reqName.empty() && isoLookup(reqName, lsn, size);
 
-                if (filePtr != 0)
+                if (found && filePtr != 0)
                 {
                     if (uint8_t *fileHost = getMemPtr(rdram, filePtr))
                     {
                         std::memset(fileHost, 0, 32);
                         std::memcpy(fileHost + 0, &lsn, 4);
                         std::memcpy(fileHost + 4, &size, 4);
-                        // name field at +8 (char name[16]); date[8] follows at +24.
                         std::string base = reqName;
                         auto slash = base.find_last_of('/');
                         if (slash != std::string::npos) base = base.substr(slash + 1);
@@ -232,61 +280,38 @@ namespace
                     }
                 }
 
-                {
-                    std::lock_guard<std::mutex> lk(g_lastCdFileMutex);
-                    g_lastCdFile = reqName;
-                }
-                std::printf("[vcd] search '%s' -> %s lsn=%u size=%u\n", reqName.c_str(),
-                            e ? e->name : "(none)", lsn, size);
+                std::printf("[iso] search '%s' -> %s lsn=%u size=%u\n", reqName.c_str(),
+                            found ? "FOUND" : "MISS", lsn, size);
                 std::fflush(stdout);
 
-                ps2_stubs::ret1(rdram, ctx, rt);
+                if (found)
+                    ps2_stubs::ret1(rdram, ctx, rt);
+                else
+                    ps2_stubs::ret0(rdram, ctx, rt);
                 if (ctx->pc == entryPc) ctx->pc = getRegU32(ctx, 31);
             });
 
-        // --- sceCdRead @ 0x467940: map lsn -> (file, offset), read real bytes, ret1 ---
+        // sceCdRead @0x467940: serve sectors straight from sm.iso at lsn*2048.
         runtime.registerFunction(0x00467940u,
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
                 const uint32_t entryPc = ctx->pc;
-                initVcdOnce();
-
-                const uint32_t lsn = getRegU32(ctx, 4);     // a0
-                const uint32_t sectors = getRegU32(ctx, 5); // a1
-                const uint32_t dest = getRegU32(ctx, 6);    // a2
+                const uint32_t lsn = getRegU32(ctx, 4);
+                const uint32_t sectors = getRegU32(ctx, 5);
+                const uint32_t dest = getRegU32(ctx, 6);
 
                 bool ok = false;
-                uint32_t got = 0;
-                const VcdEntry *e = nullptr;
-                size_t off = 0;
-
                 if (dest != 0 && sectors != 0 && sectors < 0x1000u)
                 {
                     if (uint8_t *host = getMemPtr(rdram, dest))
-                    {
-                        e = vcdFindByLsn(lsn);
-                        if (e)
-                        {
-                            off = static_cast<size_t>(lsn - e->baseLsn) * 2048u;
-                            const size_t want = static_cast<size_t>(sectors) * 2048u;
-                            size_t g = 0;
-                            if (readHostFileAt(e->name, off, host, want, g))
-                            {
-                                got = static_cast<uint32_t>(g);
-                                if (g < want) std::memset(host + g, 0, want - g);
-                                ok = true;
-                            }
-                        }
-                        if (!ok) std::memset(host, 0, static_cast<size_t>(sectors) * 2048u);
-                    }
+                        ok = isoReadSectors(lsn, sectors, host);
                 }
 
                 const uint32_t n = g_cdReadLogCount.fetch_add(1);
                 if (n < kCdReadLogCap)
                 {
-                    std::printf("[vcd] read lsn=%u sectors=%u dest=0x%x -> %s off=%zu got=%u%s\n",
-                                lsn, sectors, dest, e ? e->name : "(unmapped)", off, got,
-                                ok ? "" : " [ZERO-FILL]");
+                    std::printf("[iso] read lsn=%u sectors=%u dest=0x%x -> %s\n",
+                                lsn, sectors, dest, ok ? "ok" : "FAIL");
                     std::fflush(stdout);
                 }
 
@@ -294,7 +319,7 @@ namespace
                 if (ctx->pc == entryPc) ctx->pc = getRegU32(ctx, 31);
             });
 
-        // --- sceGsSyncV @ 0x206030: ret1 unlocks the vsync wait at 0x2313b0 (Cycle 8) ---
+        // sceGsSyncV @0x206030: ret1 unlocks the vsync wait at 0x2313b0 (see history).
         runtime.registerFunction(0x00206030u,
             [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
             {
@@ -302,8 +327,6 @@ namespace
                 ps2_stubs::ret1(rdram, ctx, rt);
                 if (ctx->pc == entryPc) ctx->pc = getRegU32(ctx, 31);
             });
-
-        // SifBindRpc triage stays via TOML ret1@0x4834E0 (see game.toml).
     }
 }
 
